@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
+	"text/template"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -15,8 +18,8 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// AlertManagerPayload represents the HTTP POST request JSON sent by the Prometheus Alert Manager.
-type AlertManagerPayload struct {
+// AlertManagerRequest represents the HTTP POST request sent by the Prometheus Alert Manager.
+type AlertManagerRequest struct {
 	Version           string            `json:"version"`
 	GroupKey          string            `json:"groupKey"`
 	Status            string            `json:"status"`
@@ -25,17 +28,14 @@ type AlertManagerPayload struct {
 	CommonLabels      map[string]string `json:"commonLabels"`
 	CommonAnnotations map[string]string `json:"commonAnnotations"`
 	ExternalURL       string            `json:"externalURL"`
-	Alerts            []Alert           `json:"alerts"`
-}
-
-// Alert represents a Prometheus alert.
-type Alert struct {
-	Status       string            `json:"status"`
-	Labels       map[string]string `json:"labels"`
-	Annotations  map[string]string `json:"annotations"`
-	StartsAt     time.Time         `json:"startsAt"`
-	EndsAt       time.Time         `json:"endsAt"`
-	GeneratorURL string            `json:"generatorURL"`
+	Alerts            []struct {
+		Status       string            `json:"status"`
+		Labels       map[string]string `json:"labels"`
+		Annotations  map[string]string `json:"annotations"`
+		StartsAt     time.Time         `json:"startsAt"`
+		EndsAt       time.Time         `json:"endsAt"`
+		GeneratorURL string            `json:"generatorURL"`
+	} `json:"alerts"`
 }
 
 // Message represents the message formats that is used to send alerts to endpoints.
@@ -46,64 +46,128 @@ type Message struct {
 }
 
 func main() {
+	initLogger(os.Getenv("LOG_LEVEL"))
 
-	os.Setenv("AWS_SDK_LOAD_CONFIG", "1")
-	client := sns.New(session.Must(session.NewSession()))
+	client := sns.New(session.Must(session.NewSessionWithOptions(session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+		Config: aws.Config{
+			Region:     aws.String(os.Getenv("AWS_SNS_REGION")),
+			MaxRetries: aws.Int(3),
+		},
+	})))
 
 	r := mux.NewRouter()
-	r.HandleFunc("/alerts", func(w http.ResponseWriter, r *http.Request) { handleAlert(w, r, client) }).Methods("POST")
-	s := &http.Server{
-		Handler: r,
-		Addr:    ":9876",
-	}
+	r.HandleFunc("/topics/{topicArn}", func(w http.ResponseWriter, r *http.Request) { handleAlert(w, r, client) }).Methods("POST")
+	r.HandleFunc("/health", handleHealth).Methods("GET")
+	r.NotFoundHandler = http.HandlerFunc(handleNotFound)
+
+	s := &http.Server{Handler: r, Addr: ":9876"}
 	log.Info("Started listening at ", ":9876")
 	log.Fatal(s.ListenAndServe())
+}
 
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	log.Debugf("Health-check from %s", r.RemoteAddr)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(http.StatusText(http.StatusOK)))
+}
+
+func handleNotFound(w http.ResponseWriter, r *http.Request) {
+	log.Debugf("Route %s is not handled", r.URL.Path)
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(http.StatusText(http.StatusNotFound)))
 }
 
 func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
-	log.Debug("Entering alert handler")
+	// Retrieve target SNS topic ARN from query params
+	vars := mux.Vars(r)
+	topicArn := vars["topicArn"]
+	log.Infof("Handling alert for topic %s", topicArn)
 
-	topicArn := os.Getenv("AWS_SNS_TOPIC_ARN")
-
-	var payload AlertManagerPayload
-	err := json.NewDecoder(r.Body).Decode(&payload)
+	// Extract Alert Manager request payload
+	var amPayload AlertManagerRequest
+	err := json.NewDecoder(r.Body).Decode(&amPayload)
 	if err != nil {
-		log.Error("Error when decoding payload: ", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
+		log.Error(err.Error())
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
 
-	payloadJSON, err := json.MarshalIndent(payload, "", "    ")
+	// Create Email template from Alert Manager data
+	emailTpl, err := loadTemplate("data/email.tpl", amPayload)
 	if err != nil {
-		log.Error("Error when marshalling payload: ", err.Error())
+		log.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	log.Debugf("Email template: %s", emailTpl)
 
-	msg := &Message{
-		DefaultEndpoint: "This is the default endpoint",
-		EmailEndpoint:   string(payloadJSON),
-		SmsEndpoint:     payload.CommonLabels["alertname"],
+	// Create SMS template from Alert Manager data
+	smsTpl, err := loadTemplate("data/sms.tpl", amPayload)
+	if err != nil {
+		log.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-	msgJSON, _ := json.Marshal(msg)
+	log.Debugf("SMS template: %s", smsTpl)
 
-	params := &sns.PublishInput{
-		MessageStructure: aws.String("json"),
-		Subject:          aws.String(fmt.Sprintf("[%s:%d] %s", payload.Status, len(payload.Alerts), payload.CommonLabels["alertname"])),
-		Message:          aws.String(string(msgJSON)),
-		TopicArn:         aws.String(topicArn),
-	}
-
-	res, err := client.Publish(params)
+	// SNS needs a specific JSON format to be published
+	msg, err := json.Marshal(&Message{
+		DefaultEndpoint: "Default endpoint. If you see this, this is probably a configuration issue.",
+		EmailEndpoint:   emailTpl,
+		SmsEndpoint:     smsTpl,
+	})
 	if err != nil {
 		log.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	log.Debug("Alert sent")
+	// Publish alert to SNS topic
+	res, err := client.Publish(&sns.PublishInput{
+		MessageStructure: aws.String("json"),
+		Subject:          aws.String(fmt.Sprintf("[%s:%d] %s", strings.ToUpper(amPayload.Status), len(amPayload.Alerts), amPayload.CommonLabels["alertname"])),
+		Message:          aws.String(string(msg)),
+		TopicArn:         aws.String(topicArn),
+	})
+	if err != nil {
+		log.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-	log.Debug(res)
+	log.Infof("Published: %s", res)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func initLogger(logLevel string) {
+	switch logLevel {
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	case "fatal":
+		log.SetLevel(log.FatalLevel)
+	default:
+		log.SetLevel(log.InfoLevel)
+	}
+}
+
+func loadTemplate(filepath string, data AlertManagerRequest) (string, error) {
+	t, err := template.New(filepath).ParseFiles(filepath)
+	if err != nil {
+		return "", err
+	}
+
+	var tpl bytes.Buffer
+	err = t.Execute(&tpl, data)
+	if err != nil {
+		log.Error(err.Error())
+		return "", err
+	}
+
+	return tpl.String(), nil
 }

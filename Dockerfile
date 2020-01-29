@@ -3,6 +3,7 @@ ENV GO111MODULE=on CGO_ENABLED=1
 WORKDIR /build
 COPY go.mod .
 COPY go.sum .
+COPY data data
 COPY am2sns.go .
 RUN go mod download
 RUN go build github.com/scalair/am2sns
