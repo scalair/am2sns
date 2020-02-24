@@ -18,6 +18,12 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// These variables are defined at compile time
+var (
+	BuildTime    string = "undefined"
+	BuildVersion string = "undefined"
+)
+
 // AlertManagerRequest represents the HTTP POST request sent by the Prometheus Alert Manager.
 type AlertManagerRequest struct {
 	Version           string            `json:"version"`
@@ -47,6 +53,9 @@ type Message struct {
 
 func main() {
 	initLogger(os.Getenv("LOG_LEVEL"))
+
+	log.Infof("Build time: %s", BuildTime)
+	log.Infof("Build version: %s", BuildVersion)
 
 	client := sns.New(session.Must(session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
@@ -101,7 +110,6 @@ func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	log.Debugf("Email template: %s", emailTpl)
 
 	// Create SMS template from Alert Manager data
 	smsTpl, err := loadTemplate("data/sms.tpl", amPayload)
@@ -110,7 +118,6 @@ func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	log.Debugf("SMS template: %s", smsTpl)
 
 	// SNS needs a specific JSON format to be published
 	msg, err := json.Marshal(&Message{
@@ -165,9 +172,9 @@ func loadTemplate(filepath string, data AlertManagerRequest) (string, error) {
 	var tpl bytes.Buffer
 	err = t.Execute(&tpl, data)
 	if err != nil {
-		log.Error(err.Error())
-		return "", err
+		log.Fatal(err.Error())
 	}
 
+	log.Debugf("Loaded template: %s", tpl.String())
 	return tpl.String(), nil
 }

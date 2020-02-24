@@ -5,9 +5,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
-    - name: Publish to Registry
+    - name: Publish to Scalair Docker Hub
       uses: elgohr/Publish-Docker-Github-Action@master
+      env:
+        GITHUB_SHA: ${{ github.sha }}
       with:
         name: scalair/am2sns
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+        buildargs: GITHUB_SHA
