@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -104,7 +105,7 @@ func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
 	defer r.Body.Close()
 
 	// Create Email template from Alert Manager data
-	emailTpl, err := loadTemplate("data/email.tpl", amPayload)
+	emailTpl, err := loadTemplate("data/email.tpl", &amPayload)
 	if err != nil {
 		log.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -112,7 +113,7 @@ func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
 	}
 
 	// Create SMS template from Alert Manager data
-	smsTpl, err := loadTemplate("data/sms.tpl", amPayload)
+	smsTpl, err := loadTemplate("data/sms.tpl", &amPayload)
 	if err != nil {
 		log.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -163,14 +164,14 @@ func initLogger(logLevel string) {
 	}
 }
 
-func loadTemplate(filepath string, data AlertManagerRequest) (string, error) {
-	t, err := template.New(filepath).ParseFiles(filepath)
+func loadTemplate(file string, data *AlertManagerRequest) (string, error) {
+	t, err := template.New(filepath.Base(file)).Funcs(template.FuncMap{"upper": strings.ToUpper}).ParseFiles(file)
 	if err != nil {
 		return "", err
 	}
 
 	var tpl bytes.Buffer
-	err = t.Execute(&tpl, data)
+	err = t.Execute(&tpl, *data)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
