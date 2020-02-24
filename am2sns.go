@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -23,6 +24,7 @@ import (
 var (
 	BuildTime    string = "undefined"
 	BuildVersion string = "undefined"
+	DryRun       bool   = false
 )
 
 // AlertManagerRequest represents the HTTP POST request sent by the Prometheus Alert Manager.
@@ -55,9 +57,13 @@ type Message struct {
 func main() {
 	initLogger(os.Getenv("LOG_LEVEL"))
 
+	// Initial informations
+	DryRun, _ = strconv.ParseBool(os.Getenv("DRY_RUN"))
+	log.Infof("Dry run mode: %t", DryRun)
 	log.Infof("Build time: %s", BuildTime)
 	log.Infof("Build version: %s", BuildVersion)
 
+	// Create HTTP client
 	client := sns.New(session.Must(session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
 		Config: aws.Config{
@@ -66,11 +72,13 @@ func main() {
 		},
 	})))
 
+	// Define routes
 	r := mux.NewRouter()
 	r.HandleFunc("/topics/{topicArn}", func(w http.ResponseWriter, r *http.Request) { handleAlert(w, r, client) }).Methods("POST")
 	r.HandleFunc("/health", handleHealth).Methods("GET")
 	r.NotFoundHandler = http.HandlerFunc(handleNotFound)
 
+	// Start server
 	s := &http.Server{Handler: r, Addr: ":9876"}
 	log.Info("Started listening at ", ":9876")
 	log.Fatal(s.ListenAndServe())
@@ -132,20 +140,22 @@ func handleAlert(w http.ResponseWriter, r *http.Request, client *sns.SNS) {
 		return
 	}
 
-	// Publish alert to SNS topic
-	res, err := client.Publish(&sns.PublishInput{
-		MessageStructure: aws.String("json"),
-		Subject:          aws.String(fmt.Sprintf("[%s:%d] %s", strings.ToUpper(amPayload.Status), len(amPayload.Alerts), amPayload.CommonLabels["alertname"])),
-		Message:          aws.String(string(msg)),
-		TopicArn:         aws.String(topicArn),
-	})
-	if err != nil {
-		log.Error(err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	if !DryRun {
+		// Publish alert to SNS topic
+		res, err := client.Publish(&sns.PublishInput{
+			MessageStructure: aws.String("json"),
+			Subject:          aws.String(fmt.Sprintf("[%s:%d] %s", strings.ToUpper(amPayload.Status), len(amPayload.Alerts), amPayload.CommonLabels["alertname"])),
+			Message:          aws.String(string(msg)),
+			TopicArn:         aws.String(topicArn),
+		})
+		if err != nil {
+			log.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		log.Infof("Published: %s", res)
 	}
 
-	log.Infof("Published: %s", res)
 	w.WriteHeader(http.StatusAccepted)
 }
 
